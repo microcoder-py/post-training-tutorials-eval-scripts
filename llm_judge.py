@@ -6,7 +6,7 @@ from together import Together
 import pandas as pd
 from pathlib import Path
 from datasets import load_dataset
-
+from tqdm import tqdm
 
 @dataclass
 class EvaluationResult:
@@ -27,7 +27,7 @@ class OverallEvaluation:
     faithfulness: Optional[EvaluationResult]
     relevance: EvaluationResult
     helpfulness: EvaluationResult
-    
+
     def to_dict(self) -> Dict:
         """Convert to dictionary for JSON serialization"""
         return {
@@ -39,7 +39,7 @@ class OverallEvaluation:
             "relevance": asdict(self.relevance),
             "helpfulness": asdict(self.helpfulness)
         }
-    
+
     def get_average_score(self) -> float:
         """Calculate average score across all evaluated metrics"""
         scores = [
@@ -57,7 +57,7 @@ class LLMJudge:
     LLM-as-a-Judge evaluator using Together AI's GPT-OSS-20B model.
     Provides reference-free evaluation on multiple quality metrics.
     """
-    
+
     # Evaluation prompts for each metric
     CORRECTNESS_PROMPT = """You are an expert evaluator assessing the correctness of an AI assistant's response.
 
@@ -182,7 +182,7 @@ Respond ONLY with the JSON object, no additional text."""
     def __init__(self, api_key: Optional[str] = None, model: str = "openai/gpt-oss-20b"):
         """
         Initialize the LLM Judge evaluator.
-        
+
         Args:
             api_key: Together AI API key (defaults to TOGETHER_API_KEY env var)
             model: Model to use for evaluation (default: openai/gpt-oss-20b)
@@ -190,18 +190,18 @@ Respond ONLY with the JSON object, no additional text."""
         self.api_key = api_key or os.environ.get("TOGETHER_API_KEY")
         if not self.api_key:
             raise ValueError("Together AI API key must be provided or set in TOGETHER_API_KEY environment variable")
-        
+
         self.model = model
         self.client = Together(api_key=self.api_key)
-    
+
     def _call_llm(self, prompt: str, temperature: float = 0.1) -> str:
         """
         Make a call to the Together AI API.
-        
+
         Args:
             prompt: The evaluation prompt
             temperature: Sampling temperature (lower = more deterministic)
-            
+
         Returns:
             The model's response text
         """
@@ -215,8 +215,8 @@ Respond ONLY with the JSON object, no additional text."""
             return response.choices[0].message.content
         except Exception as e:
             raise RuntimeError(f"Error calling Together AI API: {str(e)}")
-    
-    def _parse_json_response(self, response: str) -> Dict:
+
+    def _parse_json_response(self, response: str) -> Optional[Dict]:
         """
         Parse JSON from model response, handling markdown code blocks.
         
@@ -224,7 +224,7 @@ Respond ONLY with the JSON object, no additional text."""
             response: Raw response from the model
             
         Returns:
-            Parsed JSON dictionary
+            Parsed JSON dictionary, or None if parsing fails
         """
         # Remove markdown code blocks if present
         cleaned = response.strip()
@@ -237,51 +237,72 @@ Respond ONLY with the JSON object, no additional text."""
         cleaned = cleaned.strip()
         
         try:
-            return json.loads(cleaned)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Failed to parse JSON response: {e}\nResponse: {response}")
-    
+            parsed = json.loads(cleaned)
+        
+        # Validate expected structure
+            if not isinstance(parsed, dict) or "score" not in parsed or "reasoning" not in parsed:
+                print(f"Warning: Invalid JSON structure, skipping sample")
+                return None
+                
+            # Validate score range
+            score = float(parsed["score"])
+            if not 0.0 <= score <= 1.0:
+                print(f"Warning: Score {score} outside valid range, skipping sample")
+                return None
+                
+            return parsed
+        
+        except (json.JSONDecodeError, ValueError, KeyError) as e:
+          print(f"Warning: Failed to parse JSON response: {e}. Skipping sample.")
+          return None
+
     def evaluate_correctness(self, prompt: str, response: str) -> EvaluationResult:
         """
         Evaluate the correctness of a response.
-        
+
         Args:
             prompt: The original user prompt
             response: The AI's response to evaluate
-            
+
         Returns:
             EvaluationResult with correctness score and reasoning
         """
         eval_prompt = self.CORRECTNESS_PROMPT.format(prompt=prompt, response=response)
         raw_response = self._call_llm(eval_prompt)
         parsed = self._parse_json_response(raw_response)
-        
+
+        if parsed is None:
+          return None
+
         return EvaluationResult(
             metric="correctness",
             score=float(parsed["score"]),
             reasoning=parsed["reasoning"],
             raw_response=raw_response
         )
-    
+
     def evaluate_faithfulness(self, prompt: str, response: str, context: str) -> EvaluationResult:
         """
         Evaluate the faithfulness of a response to provided context.
-        
+
         Args:
             prompt: The original user prompt
             response: The AI's response to evaluate
             context: The context/source material the response should be faithful to
-            
+
         Returns:
             EvaluationResult with faithfulness score and reasoning
         """
         eval_prompt = self.FAITHFULNESS_PROMPT.format(
-            prompt=prompt, 
-            response=response, 
+            prompt=prompt,
+            response=response,
             context=context
         )
         raw_response = self._call_llm(eval_prompt)
         parsed = self._parse_json_response(raw_response)
+        
+        if parsed is None:
+          return None
         
         return EvaluationResult(
             metric="faithfulness",
@@ -289,91 +310,105 @@ Respond ONLY with the JSON object, no additional text."""
             reasoning=parsed["reasoning"],
             raw_response=raw_response
         )
-    
+
     def evaluate_relevance(self, prompt: str, response: str) -> EvaluationResult:
         """
         Evaluate the relevance of a response to the prompt.
-        
+
         Args:
             prompt: The original user prompt
             response: The AI's response to evaluate
-            
+
         Returns:
             EvaluationResult with relevance score and reasoning
         """
         eval_prompt = self.RELEVANCE_PROMPT.format(prompt=prompt, response=response)
         raw_response = self._call_llm(eval_prompt)
         parsed = self._parse_json_response(raw_response)
-        
+
+        if parsed is None:
+          return None
+
         return EvaluationResult(
             metric="relevance",
             score=float(parsed["score"]),
             reasoning=parsed["reasoning"],
             raw_response=raw_response
         )
-    
+
     def evaluate_helpfulness(self, prompt: str, response: str) -> EvaluationResult:
         """
         Evaluate the helpfulness of a response.
-        
+
         Args:
             prompt: The original user prompt
             response: The AI's response to evaluate
-            
+
         Returns:
             EvaluationResult with helpfulness score and reasoning
         """
         eval_prompt = self.HELPFULNESS_PROMPT.format(prompt=prompt, response=response)
         raw_response = self._call_llm(eval_prompt)
         parsed = self._parse_json_response(raw_response)
-        
+
+        if parsed is None:
+          return None
+
         return EvaluationResult(
             metric="helpfulness",
             score=float(parsed["score"]),
             reasoning=parsed["reasoning"],
             raw_response=raw_response
         )
-    
+
     def evaluate_all(
-        self, 
-        prompt: str, 
-        response: str, 
+        self,
+        prompt: str,
+        response: str,
         context: Optional[str] = None,
         metrics: Optional[List[str]] = None
     ) -> OverallEvaluation:
         """
         Evaluate a response on all available metrics.
-        
+
         Args:
             prompt: The original user prompt
             response: The AI's response to evaluate
             context: Optional context for faithfulness evaluation
             metrics: List of metrics to evaluate. If None, evaluates all applicable metrics.
                     Options: ["correctness", "faithfulness", "relevance", "helpfulness"]
-            
+
         Returns:
             OverallEvaluation containing all evaluation results
         """
         if metrics is None:
-            metrics = ["correctness", "relevance", "helpfulness"]
-            if context:
-                metrics.append("faithfulness")
-        
+          metrics = ["correctness", "relevance", "helpfulness"]
+          if context:
+              metrics.append("faithfulness")
+            
         results = {}
         
         if "correctness" in metrics:
             results["correctness"] = self.evaluate_correctness(prompt, response)
+            if results["correctness"] is None:
+                return None
         
         if "faithfulness" in metrics:
             if not context:
                 raise ValueError("Context is required for faithfulness evaluation")
             results["faithfulness"] = self.evaluate_faithfulness(prompt, response, context)
+            if results["faithfulness"] is None:
+                return None
         
         if "relevance" in metrics:
             results["relevance"] = self.evaluate_relevance(prompt, response)
+            if results["relevance"] is None:
+                return None
         
         if "helpfulness" in metrics:
             results["helpfulness"] = self.evaluate_helpfulness(prompt, response)
+            if results["helpfulness"] is None:
+                return None
         
         return OverallEvaluation(
             prompt=prompt,
@@ -384,7 +419,7 @@ Respond ONLY with the JSON object, no additional text."""
             relevance=results.get("relevance"),
             helpfulness=results.get("helpfulness")
         )
-    
+
     def evaluate_batch(
         self,
         test_cases: List[Dict],
@@ -395,26 +430,26 @@ Respond ONLY with the JSON object, no additional text."""
     ) -> List[OverallEvaluation]:
         """
         Evaluate a batch of test cases.
-        
+
         Args:
             test_cases: List of dictionaries containing test cases
             context_key: Key name for context in test case dict (default: "context")
             prompt_key: Key name for prompt in test case dict (default: "prompt")
             response_key: Key name for response in test case dict (default: "response")
             metrics: List of metrics to evaluate for each case
-            
+
         Returns:
             List of OverallEvaluation objects
         """
         results = []
-        
+
         for i, test_case in enumerate(test_cases):
-            print(f"Evaluating test case {i+1}/{len(test_cases)}...")
-            
+
+
             prompt = test_case[prompt_key]
             response = test_case[response_key]
             context = test_case.get(context_key)
-            
+
             evaluation = self.evaluate_all(
                 prompt=prompt,
                 response=response,
@@ -422,9 +457,9 @@ Respond ONLY with the JSON object, no additional text."""
                 metrics=metrics
             )
             results.append(evaluation)
-        
+
         return results
-    
+
     def load_and_evaluate_from_jsonl(
         self,
         jsonl_path: str,
@@ -437,7 +472,7 @@ Respond ONLY with the JSON object, no additional text."""
         """
         Load a JSONL file, evaluate outputs using LLM-as-a-judge, and return results as DataFrame.
         Optionally loads category and topic information from the HuggingFace dataset.
-        
+
         Args:
             jsonl_path: Path to JSONL file containing test cases
             id_key: Key name for ID in JSONL (default: "id")
@@ -445,7 +480,7 @@ Respond ONLY with the JSON object, no additional text."""
             output_key: Key name for output/response in JSONL (default: "output")
             metrics: List of metrics to evaluate (default: all except faithfulness)
             load_reference_data: Whether to load category/topic from HF dataset (default: True)
-            
+
         Returns:
             pandas DataFrame with evaluation results including scores, reasoning, and metadata
         """
@@ -456,9 +491,9 @@ Respond ONLY with the JSON object, no additional text."""
             for line in f:
                 if line.strip():
                     test_cases.append(json.loads(line))
-        
+
         print(f"Loaded {len(test_cases)} test cases")
-        
+
         # Load reference dataset if requested
         reference_data = {}
         if load_reference_data:
@@ -466,7 +501,7 @@ Respond ONLY with the JSON object, no additional text."""
             try:
                 hf_dataset = load_dataset("pt-tutorials-temp/llm-judge", split="train")
                 # Create mapping from id to category and topic
-                for item in hf_dataset:
+                for item in tqdm(hf_dataset, desc="Processing reference data"):
                     reference_data[item['id']] = {
                         'instruction': item['instruction'],
                         'task': item['task'],
@@ -476,20 +511,18 @@ Respond ONLY with the JSON object, no additional text."""
             except Exception as e:
                 print(f"Warning: Could not load reference dataset: {e}")
                 load_reference_data = False
-        
+
         # Evaluate all test cases
         results = []
-        for i, test_case in enumerate(test_cases):
-            print(f"\nEvaluating test case {i+1}/{len(test_cases)}...")
-            
+        for test_case in tqdm(test_cases, desc="Evaluating test cases"):
             test_id = test_case.get(id_key)
             prompt = test_case.get(input_key, "")
             response = test_case.get(output_key, "")
-            
+
             if not prompt or not response:
-                print(f"  Skipping case {test_id}: missing input or output")
+                tqdm.write(f"  Skipping case {test_id}: missing input or output")
                 continue
-            
+
             # Run evaluation
             evaluation = self.evaluate_all(
                 prompt=prompt,
@@ -497,7 +530,11 @@ Respond ONLY with the JSON object, no additional text."""
                 context=None,
                 metrics=metrics or ["correctness", "relevance", "helpfulness"]
             )
-            
+
+            if evaluation is None:
+                tqdm.write(f"  Skipping case {test_id}: evaluation failed")
+                continue
+
             # Build result dictionary
             result = {
                 'id': test_id,
@@ -511,24 +548,24 @@ Respond ONLY with the JSON object, no additional text."""
                 'helpfulness_reasoning': evaluation.helpfulness.reasoning if evaluation.helpfulness else None,
                 'average_score': evaluation.get_average_score()
             }
-            
+
             # Add faithfulness if evaluated
             if evaluation.faithfulness:
                 result['faithfulness_score'] = evaluation.faithfulness.score
                 result['faithfulness_reasoning'] = evaluation.faithfulness.reasoning
-            
+
             # Add reference data if available
             if load_reference_data and test_id in reference_data:
                 ref = reference_data[test_id]
                 result['reference_instruction'] = ref['instruction']
                 result['task'] = ', '.join(ref['task']) if isinstance(ref['task'], list) else ref['task']
                 result['topic'] = ', '.join(ref['topic']) if isinstance(ref['topic'], list) else ref['topic']
-            
+
             results.append(result)
-        
+
         # Convert to DataFrame
         df = pd.DataFrame(results)
-        
+
         print(f"\n{'='*80}")
         print(f"Evaluation complete!")
         print(f"Total cases evaluated: {len(results)}")
@@ -540,9 +577,9 @@ Respond ONLY with the JSON object, no additional text."""
         if load_reference_data:
             print(f"\nReference metadata loaded for {df['task'].notna().sum()} cases")
         print(f"{'='*80}\n")
-        
+
         return df
-    
+
     def save_results(
         self,
         df: pd.DataFrame,
@@ -551,7 +588,7 @@ Respond ONLY with the JSON object, no additional text."""
     ):
         """
         Save evaluation results to file.
-        
+
         Args:
             df: DataFrame with evaluation results
             output_path: Path to save the results
@@ -559,7 +596,7 @@ Respond ONLY with the JSON object, no additional text."""
         """
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         if format == 'csv':
             df.to_csv(output_path, index=False)
         elif format == 'json':
@@ -568,5 +605,5 @@ Respond ONLY with the JSON object, no additional text."""
             df.to_excel(output_path, index=False)
         else:
             raise ValueError(f"Unsupported format: {format}")
-        
+
         print(f"Results saved to {output_path}")
