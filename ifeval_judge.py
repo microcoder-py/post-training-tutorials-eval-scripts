@@ -7,7 +7,7 @@ import nltk
 class IFEvalSetup:
     def __init__(
         self,
-        dataset_name="pt-tutorials-temp/if-eval-subset",
+        dataset_name="google/IFEval",
         split="train",
         output_dataset_path="ifeval_dataset"
     ):
